@@ -23,7 +23,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo -e "\n${GREEN}======================================================${NC}"
-echo -e "${GREEN}  VK Cloud CDN Bridge + Smart Routing + Security      ${NC}"
+echo -e "${GREEN}  VK Cloud CDN Bridge + Smart Routing + SSH Hardening ${NC}"
 echo -e "${GREEN}======================================================${NC}\n"
 
 # ==============================================================================
@@ -101,7 +101,7 @@ for jf in json_files:
         token = fname.replace(".json", "")
         break
 
-# 6. Public Key Reality (из HTML или генерируем из privateKey)
+# 6. Public Key Reality (из HTML)
 pbk = ""
 html_files = glob.glob("/var/www/*/*.html")
 for hf in html_files:
@@ -125,7 +125,7 @@ PYEOF
 
 eval "$EXTRACTED_VARS"
 
-# Определение SSH порта
+# Определение текущего SSH порта
 AUTO_SSH=$(grep -m1 -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' || true)
 if [[ -z "$AUTO_SSH" ]]; then
     AUTO_SSH=$(ss -tlpn | grep -E "sshd|ssh" | awk '{print $4}' | awk -F: '{print $NF}' | head -n 1 || true)
@@ -150,8 +150,16 @@ SUB_TOKEN=${SUB_TOKEN:-$AUTO_TOKEN}
 read -rp "4. IP адрес EU VPS [Определено: ${AUTO_EU_IP}]: " EU_IP
 EU_IP=${EU_IP:-$AUTO_EU_IP}
 
-read -rp "5. SSH порт сервера [Определено: ${AUTO_SSH}]: " SSH_PORT
-SSH_PORT=${SSH_PORT:-$AUTO_SSH}
+read -rp "5. Новый SSH порт сервера [по умолчанию: 22222]: " NEW_SSH_PORT
+NEW_SSH_PORT=${NEW_SSH_PORT:-22222}
+
+echo -e "\n${YELLOW}Вставьте ваш публичный SSH-ключ (начинается с ssh-ed25519 или ssh-rsa):${NC}"
+echo -e "${YELLOW}(Если ключ уже добавлен на сервер, нажмите Enter)${NC}"
+read -rp "SSH Public Key: " SSH_PUB_KEY
+
+if [[ -z "$SSH_PUB_KEY" && ! -s ~/.ssh/authorized_keys ]]; then
+    log_err "SSH-ключ не передан, а файл ~/.ssh/authorized_keys пуст! Отключение паролей заблокирует доступ к серверу."
+fi
 
 UUID="${AUTO_UUID:-722ac689-1141-ef19-5a42-7166f89bd485}"
 PBK="${AUTO_PBK:-hVWQuKYZe14Usj0b_0AN8hGfm5Ju8L63AY9J2f_mOR0}"
@@ -160,9 +168,43 @@ XHTTP_PATH="/static/getFile/video/segment.ts"
 LOCAL_PORT=4443
 
 # ==============================================================================
-# 1. ТЮНИНГ ЯДРА LINUX (SYSCTL)
+# 1. НАСТРОЙКА SSH КЛЮЧЕЙ И ОТКЛЮЧЕНИЕ ПАРОЛЕЙ
 # ==============================================================================
-log_info "1/6. Применение сетевого тюнинга ядра (BBR, буферы)..."
+log_info "1/7. Настройка SSH (порт ${NEW_SSH_PORT}, доступ только по ключам)..."
+
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+
+if [[ -n "$SSH_PUB_KEY" ]]; then
+    if ! grep -Fxq "$SSH_PUB_KEY" ~/.ssh/authorized_keys; then
+        echo "$SSH_PUB_KEY" >> ~/.ssh/authorized_keys
+        log_success "SSH-ключ добавлен в ~/.ssh/authorized_keys."
+    fi
+fi
+
+# Настройка основного sshd_config
+sed -i "s/^#\?Port .*/Port $NEW_SSH_PORT/" /etc/ssh/sshd_config
+sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+
+# Переопределение парольного входа в дополнительных конфигах Ubuntu (sshd_config.d/*.conf)
+if ls /etc/ssh/sshd_config.d/*.conf 1> /dev/null 2>&1; then
+    sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+    sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+fi
+
+sshd -t || log_err "Ошибка в конфигурации sshd! Проверьте параметры вручную."
+systemctl restart ssh || systemctl restart sshd
+log_success "Служба SSH перезапущена на порту ${NEW_SSH_PORT}."
+
+# ==============================================================================
+# 2. ТЮНИНГ ЯДРА LINUX (SYSCTL)
+# ==============================================================================
+log_info "2/7. Применение сетевого тюнинга ядра (BBR, буферы)..."
 cat << 'EOF' > /etc/sysctl.d/99-vless-cdn-bridge.conf
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -178,9 +220,9 @@ sysctl --system > /dev/null 2>&1
 log_success "Параметры sysctl применены."
 
 # ==============================================================================
-# 2. КОНФИГУРАЦИЯ XRAY (INBOUND VK + ДВУСТОРОННИЙ РОУТИНГ)
+# 3. КОНФИГУРАЦИЯ XRAY (INBOUND VK + ДВУСТОРОННИЙ РОУТИНГ)
 # ==============================================================================
-log_info "2/6. Обновление ядра Xray (VK inbound + RU direct routing)..."
+log_info "3/7. Обновление ядра Xray (VK inbound + RU direct routing)..."
 
 python3 - << PYEOF
 import json
@@ -268,9 +310,9 @@ systemctl restart xray
 log_success "Xray перезапущен и протестирован."
 
 # ==============================================================================
-# 3. НАСТРОЙКА NGINX (ПРОКСИРОВАНИЕ XHTTP + РАЗДАЧА КОНФИГОВ)
+# 4. НАСТРОЙКА NGINX (ПРОКСИРОВАНИЕ XHTTP + РАЗДАЧА КОНФИГОВ)
 # ==============================================================================
-log_info "3/6. Настройка Nginx..."
+log_info "4/7. Настройка Nginx..."
 WEB_ROOT="/var/www/${ORIGIN_DOMAIN}"
 mkdir -p "$WEB_ROOT"
 
@@ -389,11 +431,11 @@ systemctl restart nginx
 log_success "Nginx перезапущен и работает."
 
 # ==============================================================================
-# 4. ГЕНЕРАЦИЯ КЛИЕНТСКИХ JSON (ДЛЯ РФ И ДЛЯ ЗАГРАНИЦЫ)
+# 5. ГЕНЕРАЦИЯ КЛИЕНТСКИХ JSON (ДЛЯ РФ И ДЛЯ ЗАГРАНИЦЫ)
 # ==============================================================================
-log_info "4/6. Генерация файлов конфигурации (config.json и config-abroad.json)..."
+log_info "5/7. Генерация файлов конфигурации (config.json и config-abroad.json)..."
 
-# 4.1. РФ -> Мир (Белые списки через CDN)
+# 5.1. РФ -> Мир (Белые списки через CDN)
 cat << EOF > "${WEB_ROOT}/config.json"
 {
   "remarks": "🇳🇱 🇷🇺 Белые списки",
@@ -415,7 +457,9 @@ cat << EOF > "${WEB_ROOT}/config.json"
     {
       "tag": "🇳🇱 🇷🇺 Белые списки",
       "protocol": "vless",
-      "settings": { "vnext": [ { "address": "${CDN_HOST}", "port": 443, "users": [ { "id": "${UUID}", "encryption": "none" } ] } ] },
+      "settings": {
+        "vnext": [ { "address": "${CDN_HOST}", "port": 443, "users": [ { "id": "${UUID}", "encryption": "none" } ] } ]
+      },
       "streamSettings": {
         "network": "xhttp",
         "security": "tls",
@@ -470,7 +514,7 @@ cat << EOF > "${WEB_ROOT}/config.json"
 }
 EOF
 
-# 4.2. Заграница -> РФ (Весь мир direct, РФ через Reality RU VPS)
+# 5.2. Заграница -> РФ (Весь мир direct, РФ через Reality RU VPS)
 cat << EOF > "${WEB_ROOT}/config-abroad.json"
 {
   "remarks": "🇷🇺 ✈️ Заграница (Только RU сервисы)",
@@ -541,7 +585,7 @@ cat << EOF > "${WEB_ROOT}/config-abroad.json"
 }
 EOF
 
-# 4.3. Обновляем общий JSON подписки (добавляем CDN профиль)
+# 5.3. Обновляем общий JSON подписки (добавляем CDN профиль)
 SUB_JSON_PATH="${WEB_ROOT}/${SUB_TOKEN}.json"
 if [[ -f "$SUB_JSON_PATH" ]]; then
 python3 - << PYEOF
@@ -607,9 +651,9 @@ PYEOF
 fi
 
 # ==============================================================================
-# 5. СБОРКА HTML ПОРТАЛА
+# 6. СБОРКА HTML ПОРТАЛА
 # ==============================================================================
-log_info "5/6. Сборка HTML страницы подписки..."
+log_info "6/7. Сборка HTML страницы подписки..."
 FULL_JSON_CONTENT=$(cat "${WEB_ROOT}/config.json")
 ABROAD_JSON_CONTENT=$(cat "${WEB_ROOT}/config-abroad.json")
 
@@ -673,21 +717,21 @@ chmod -R 644 "${WEB_ROOT}"/*
 chmod 755 "$WEB_ROOT"
 
 # ==============================================================================
-# 6. БЕЗОПАСНОСТЬ: ФАЕРВОЛ UFW + FAIL2BAN
+# 7. БЕЗОПАСНОСТЬ: ФАЕРВОЛ UFW + FAIL2BAN
 # ==============================================================================
-log_info "6/6. Настройка фаервола UFW и службы Fail2ban..."
+log_info "7/7. Настройка фаервола UFW и службы Fail2ban..."
 
 # UFW
 ufw --force reset > /dev/null 2>&1
 ufw default deny incoming > /dev/null 2>&1
 ufw default allow outgoing > /dev/null 2>&1
 
-ufw allow "${SSH_PORT}/tcp" comment 'SSH' > /dev/null 2>&1
+ufw allow "${NEW_SSH_PORT}/tcp" comment 'SSH custom port' > /dev/null 2>&1
 ufw allow 80/tcp comment 'Certbot HTTP-01' > /dev/null 2>&1
 ufw allow 443/tcp comment 'Xray Reality and CDN' > /dev/null 2>&1
 
 ufw --force enable > /dev/null 2>&1
-log_success "Фаервол UFW настроен (открыты порты: ${SSH_PORT}, 80, 443)."
+log_success "Фаервол UFW настроен (открыты порты: ${NEW_SSH_PORT}, 80, 443)."
 
 # Fail2ban (только SSH, веб-джейлы отключены во избежание бана узлов VK CDN)
 WHITELIST_IPS="127.0.0.1/8 ::1"
@@ -708,7 +752,7 @@ backend = systemd
 
 [sshd]
 enabled = true
-port = ${SSH_PORT}
+port = ${NEW_SSH_PORT}
 mode = aggressive
 maxretry = 3
 findtime = 10m
@@ -723,15 +767,23 @@ EOF
 
 systemctl restart fail2ban
 systemctl enable fail2ban > /dev/null 2>&1
-log_success "Fail2ban настроен и защищает SSH порт ${SSH_PORT}."
+log_success "Fail2ban настроен и защищает SSH порт ${NEW_SSH_PORT}."
 
 # ==============================================================================
-# ФИНАЛЬНЫЙ СТАТУС
+# ДИАГНОСТИКА И ИТОГОВЫЙ СТАТУС
 # ==============================================================================
 echo -e "\n${GREEN}======================================================${NC}"
 echo -e "${GREEN}      УСТАНОВКА И НАСТРОЙКА УСПЕШНО ЗАВЕРШЕНЫ!       ${NC}"
 echo -e "${GREEN}======================================================${NC}\n"
-echo -e " Веб-портал подписки:      ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.html${NC}"
+
+echo -e "${BLUE}--- Параметры SSH ---${NC}"
+sshd -T | grep -E '^(port|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)'
+
+echo -e "\n${BLUE}--- Веб-ресурсы подписки ---${NC}"
+echo -e " Веб-портал:               ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.html${NC}"
 echo -e " Подписка нод (HAPP):      ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.json${NC}"
 echo -e " Конфиг РФ -> Мир (JSON):  ${BLUE}https://${ORIGIN_DOMAIN}/config.json${NC}"
 echo -e " Конфиг Заграница (JSON):  ${BLUE}https://${ORIGIN_DOMAIN}/config-abroad.json${NC}\n"
+
+echo -e "${YELLOW}ВНИМАНИЕ!${NC} Перед закрытием текущей сессии откройте новое окно терминала и проверьте вход:"
+echo -e "  ${BLUE}ssh -p ${NEW_SSH_PORT} root@${ORIGIN_DOMAIN}${NC}\n"
