@@ -8,6 +8,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
 
 log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -23,7 +24,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo -e "\n${GREEN}======================================================${NC}"
-echo -e "${GREEN}  VK Cloud CDN Bridge + Smart Routing + SSH Hardening ${NC}"
+echo -e "${GREEN}  VK Cloud CDN Bridge + Smart Routing + Security      ${NC}"
 echo -e "${GREEN}======================================================${NC}\n"
 
 # ==============================================================================
@@ -97,7 +98,7 @@ token = ""
 json_files = glob.glob("/var/www/*/*.json")
 for jf in json_files:
     fname = os.path.basename(jf)
-    if fname not in ["config.json", "config-abroad.json"]:
+    if fname not in ["config.json", "config-abroad.json", "all-in-one.json"]:
         token = fname.replace(".json", "")
         break
 
@@ -168,7 +169,7 @@ XHTTP_PATH="/static/getFile/video/segment.ts"
 LOCAL_PORT=4443
 
 # ==============================================================================
-# 1. НАСТРОЙКА SSH КЛЮЧЕЙ И ОТКЛЮЧЕНИЕ ПАРОЛЕЙ
+# 1. НАСТРОЙКА SSH КЛЮЧЕЙ, ПОРТА И ОТКЛЮЧЕНИЕ ПАРОЛЕЙ
 # ==============================================================================
 log_info "1/7. Настройка SSH (порт ${NEW_SSH_PORT}, доступ только по ключам)..."
 
@@ -197,8 +198,20 @@ if ls /etc/ssh/sshd_config.d/*.conf 1> /dev/null 2>&1; then
     sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 fi
 
+# Переопределение systemd socket activation (Ubuntu 22.10+ / 24.04 / Debian 12)
+if systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl list-unit-files | grep -q "ssh.socket"; then
+    mkdir -p /etc/systemd/system/ssh.socket.d
+    cat << EOF > /etc/systemd/system/ssh.socket.d/override.conf
+[Socket]
+ListenStream=
+ListenStream=${NEW_SSH_PORT}
+EOF
+    systemctl daemon-reload
+    systemctl restart ssh.socket || true
+fi
+
 sshd -t || log_err "Ошибка в конфигурации sshd! Проверьте параметры вручную."
-systemctl restart ssh || systemctl restart sshd
+systemctl restart ssh || systemctl restart sshd || true
 log_success "Служба SSH перезапущена на порту ${NEW_SSH_PORT}."
 
 # ==============================================================================
@@ -310,7 +323,7 @@ systemctl restart xray
 log_success "Xray перезапущен и протестирован."
 
 # ==============================================================================
-# 4. НАСТРОЙКА NGINX (ПРОКСИРОВАНИЕ XHTTP + РАЗДАЧА КОНФИГОВ)
+# 4. НАСТРОЙКА NGINX
 # ==============================================================================
 log_info "4/7. Настройка Nginx..."
 WEB_ROOT="/var/www/${ORIGIN_DOMAIN}"
@@ -345,6 +358,19 @@ server {
     large_client_header_buffers 8 16k;
     client_max_body_size 0;
     gzip off;
+
+    location = /all-in-one.json {
+        default_type application/json;
+        add_header Content-Type "application/json; charset=utf-8" always;
+        add_header profile-title "base64:8J+PhPCfj77igI3imYLvuI8gSnVyZ2VuVlBO" always;
+        add_header profile-color "#5C3A86" always;
+        add_header subscription-userinfo "upload=0; download=0; total=1099511627776; expire=1999999999" always;
+        add_header announce "base64:0JHQtdC70YvQtSDRgdC/0LjRgdC60Lgg4oCUINGC0L7Qu9GM0LrQviDQs9C70YPRiNC40LvQutC4IExURQrQl9Cw0LPRgNCw0L3QuNGG0LAg4oCUINCx0LDQvdC60Lgg0LIg0L/QvtC10LfQtNC60LDRhArQnNC+0YHRgtGLIFJVPkVVIOKAlCDQutCw0YHQutCw0LQg0YfQtdGA0LXQtyDQoNGEIHwgzrA=" always;
+        add_header profile-update-interval "12" always;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header Pragma "no-cache" always;
+        add_header Expires "0" always;
+    }
 
     location = /${SUB_TOKEN}.json {
         default_type application/json;
@@ -431,9 +457,9 @@ systemctl restart nginx
 log_success "Nginx перезапущен и работает."
 
 # ==============================================================================
-# 5. ГЕНЕРАЦИЯ КЛИЕНТСКИХ JSON (ДЛЯ РФ И ДЛЯ ЗАГРАНИЦЫ)
+# 5. ГЕНЕРАЦИЯ КЛИЕНТСКИХ JSON
 # ==============================================================================
-log_info "5/7. Генерация файлов конфигурации (config.json и config-abroad.json)..."
+log_info "5/7. Генерация файлов конфигурации (config.json, config-abroad.json, all-in-one.json)..."
 
 # 5.1. РФ -> Мир (Белые списки через CDN)
 cat << EOF > "${WEB_ROOT}/config.json"
@@ -514,7 +540,7 @@ cat << EOF > "${WEB_ROOT}/config.json"
 }
 EOF
 
-# 5.2. Заграница -> РФ (Весь мир direct, РФ через Reality RU VPS)
+# 5.2. Заграница -> РФ
 cat << EOF > "${WEB_ROOT}/config-abroad.json"
 {
   "remarks": "🇷🇺 ✈️ Заграница (Только RU сервисы)",
@@ -585,15 +611,17 @@ cat << EOF > "${WEB_ROOT}/config-abroad.json"
 }
 EOF
 
-# 5.3. Обновляем общий JSON подписки (добавляем CDN профиль)
-SUB_JSON_PATH="${WEB_ROOT}/${SUB_TOKEN}.json"
-if [[ -f "$SUB_JSON_PATH" ]]; then
+# 5.3. Обновляем общий JSON подписки (SUB_TOKEN.json) и формируем all-in-one.json
 python3 - << PYEOF
 import json
 
-path = "${SUB_JSON_PATH}"
-with open(path, "r") as f:
-    data = json.load(f)
+path = "${WEB_ROOT}/${SUB_TOKEN}.json"
+data = []
+if os.path.exists(path):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except: pass
 
 cdn_profile = {
     "tag": "🇳🇱 🇷🇺 Белые списки",
@@ -645,10 +673,12 @@ elif isinstance(data, dict):
     outbounds.insert(0, cdn_profile)
     data["outbounds"] = outbounds
 
-with open(path, "w") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
+if data:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    with open("${WEB_ROOT}/all-in-one.json", "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 PYEOF
-fi
 
 # ==============================================================================
 # 6. СБОРКА HTML ПОРТАЛА
@@ -674,7 +704,15 @@ window.onclick=function(e){e.target==document.getElementById("qrModal")&&closeMo
 </script>
 </head><body>
 
-<h2>📂 Ссылка на подписку (список нод)</h2>
+<h2>🚀 Единая подписка (All-in-One)</h2>
+<div class="config-row" style="border: 1px solid #5C3A86;">
+    <div class="config-label" style="background:#5C3A86;color:#fff;">JurgenVPN Master</div>
+    <div class="config-code" id="masterLink">https://${ORIGIN_DOMAIN}/all-in-one.json</div>
+    <button class="btn-action copy-btn" onclick="copyText('masterLink', this)">Copy</button>
+    <button class="btn-action qr-btn" onclick="showQR('masterLink')">QR</button>
+</div>
+
+<h2>📂 Ссылка на подписку (autoXRAY)</h2>
 <div class="config-row">
     <div class="config-label">Subscription URL</div>
     <div class="config-code" id="subLink">https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.json</div>
@@ -682,7 +720,7 @@ window.onclick=function(e){e.target==document.getElementById("qrModal")&&closeMo
     <button class="btn-action qr-btn" onclick="showQR('subLink')">QR</button>
 </div>
 
-<h2>📱 Приложение HAPP (Windows/Android/iOS/MAC/Linux)</h2>
+<h2>📱 Приложения</h2>
 <div class="btn-group">
     <a href="happ://add/https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.json" class="btn">⚡ Add to HAPP</a>
     <a href="https://www.happ.su/main/ru" target="_blank" class="btn download">⬇️ Download App</a>
@@ -733,7 +771,7 @@ ufw allow 443/tcp comment 'Xray Reality and CDN' > /dev/null 2>&1
 ufw --force enable > /dev/null 2>&1
 log_success "Фаервол UFW настроен (открыты порты: ${NEW_SSH_PORT}, 80, 443)."
 
-# Fail2ban (только SSH, веб-джейлы отключены во избежание бана узлов VK CDN)
+# Fail2ban
 WHITELIST_IPS="127.0.0.1/8 ::1"
 [[ -n "$EU_IP" ]] && WHITELIST_IPS="${WHITELIST_IPS} ${EU_IP}"
 
@@ -777,13 +815,14 @@ echo -e "${GREEN}      УСТАНОВКА И НАСТРОЙКА УСПЕШНО �
 echo -e "${GREEN}======================================================${NC}\n"
 
 echo -e "${BLUE}--- Параметры SSH ---${NC}"
-sshd -T | grep -E '^(port|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)'
+sshd -T | grep -E '^(port|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)' || true
 
 echo -e "\n${BLUE}--- Веб-ресурсы подписки ---${NC}"
-echo -e " Веб-портал:               ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.html${NC}"
-echo -e " Подписка нод (HAPP):      ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.json${NC}"
-echo -e " Конфиг РФ -> Мир (JSON):  ${BLUE}https://${ORIGIN_DOMAIN}/config.json${NC}"
-echo -e " Конфиг Заграница (JSON):  ${BLUE}https://${ORIGIN_DOMAIN}/config-abroad.json${NC}\n"
+echo -e " 🚀 Мастер-подписка All-in-One: ${PURPLE}https://${ORIGIN_DOMAIN}/all-in-one.json${NC}"
+echo -e " 🌐 Веб-портал:                 ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.html${NC}"
+echo -e " 📱 Подписка autoXRAY:          ${BLUE}https://${ORIGIN_DOMAIN}/${SUB_TOKEN}.json${NC}"
+echo -e " 🇳🇱 Конфиг РФ -> Мир (JSON):    ${BLUE}https://${ORIGIN_DOMAIN}/config.json${NC}"
+echo -e " 🇷🇺 Конфиг Заграница (JSON):    ${BLUE}https://${ORIGIN_DOMAIN}/config-abroad.json${NC}\n"
 
 echo -e "${YELLOW}ВНИМАНИЕ!${NC} Перед закрытием текущей сессии откройте новое окно терминала и проверьте вход:"
 echo -e "  ${BLUE}ssh -p ${NEW_SSH_PORT} root@${ORIGIN_DOMAIN}${NC}\n"
