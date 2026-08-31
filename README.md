@@ -1,7 +1,7 @@
 # CDN-VK
 
 for eu vps 
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/jurgenio/CDN-VK/main/setup-eu.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jurgenio/CDN-VK/refs/heads/main/setup-eu-vps.sh)"
 
 for ru vps
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jurgenio/CDN-VK/main/install.sh)"
