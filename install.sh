@@ -806,7 +806,31 @@ EOF
 systemctl restart fail2ban
 systemctl enable fail2ban > /dev/null 2>&1
 log_success "Fail2ban настроен и защищает SSH порт ${NEW_SSH_PORT}."
+# ==============================================================================
+# 8. НАСТРОЙКА УЧЕТНОЙ ЗАПИСИ SERVERCAT ДЛЯ МОНИТОРИНГА
+# ==============================================================================
+log_info "6/7. Настройка изолированного пользователя servercat..."
 
+if id "servercat" &>/dev/null; then
+    # Если скрипт запускается повторно, временно возвращаем права для генерации новых ключей
+    chmod 755 /home/servercat 2>/dev/null || true
+    chmod 700 /home/servercat/.ssh 2>/dev/null || true
+    rm -f /home/servercat/.ssh/id_ed25519* /home/servercat/.ssh/authorized_keys
+else
+    adduser --disabled-password --gecos "" servercat > /dev/null 2>&1
+fi
+
+mkdir -p /home/servercat/.ssh
+ssh-keygen -t ed25519 -N "" -f /home/servercat/.ssh/id_ed25519 -C "servercat_monitoring" -q
+cat /home/servercat/.ssh/id_ed25519.pub > /home/servercat/.ssh/authorized_keys
+
+chown -R servercat:servercat /home/servercat/.ssh
+chmod 400 /home/servercat/.ssh/authorized_keys
+chmod 500 /home/servercat/.ssh
+chmod 555 /home/servercat
+
+SERVERCAT_PRIV_KEY=$(cat /home/servercat/.ssh/id_ed25519)
+log_success "Пользователь servercat и SSH-ключи успешно сгенерированы (Read-Only)."
 # ==============================================================================
 # ДИАГНОСТИКА И ИТОГОВЫЙ СТАТУС
 # ==============================================================================
